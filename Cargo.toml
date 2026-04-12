@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/heliosdb-types",
+    "crates/heliosdb-sst",
+    "crates/heliosdb-engine",
+    "crates/heliosdb",
+]
+resolver = "2"
+
+[workspace.dependencies]
+bytes       = "1"
+crc32fast   = "1"
+thiserror   = "1"
+tracing     = "0.1"
+parking_lot = "0.12"
+crossbeam-skiplist = "0.1"
+snap        = "1"
+zstd        = "0.13"
+
+[workspace.dependencies.heliosdb-types]
+path = "crates/heliosdb-types"
+
+[workspace.dependencies.heliosdb-sst]
+path = "crates/heliosdb-sst"
+
+[workspace.dependencies.heliosdb-engine]
+path = "crates/heliosdb-engine"
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1

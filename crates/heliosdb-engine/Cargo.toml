@@ -1,0 +1,22 @@
+[package]
+name    = "heliosdb-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+heliosdb-types = { workspace = true }
+heliosdb-sst   = { workspace = true }
+bytes          = { workspace = true }
+crc32fast      = { workspace = true }
+parking_lot    = { workspace = true }
+crossbeam-skiplist = { workspace = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }
+
+[dev-dependencies]
+tempfile  = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name    = "engine_bench"
+harness = false

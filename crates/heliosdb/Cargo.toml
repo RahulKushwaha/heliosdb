@@ -1,0 +1,20 @@
+[package]
+name    = "heliosdb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+heliosdb-types  = { workspace = true }
+heliosdb-sst    = { workspace = true }
+heliosdb-engine = { workspace = true }
+bytes           = { workspace = true }
+parking_lot     = { workspace = true }
+tracing         = { workspace = true }
+
+[dev-dependencies]
+tempfile             = "3"
+tracing-subscriber   = "0.3"
+
+[[bin]]
+name = "helios_cli"
+path = "src/bin/helios_cli.rs"
