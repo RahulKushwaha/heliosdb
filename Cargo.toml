@@ -4,6 +4,7 @@ members = [
     "crates/heliosdb-sst",
     "crates/heliosdb-engine",
     "crates/heliosdb",
+    "crates/heliosdb-book",
 ]
 resolver = "2"
 
