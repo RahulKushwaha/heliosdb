@@ -14,38 +14,36 @@ heliosdb          (public API, CLI)
 ## Component map
 
 ```
-┌────────────────────────────────────────────────┐
-│                 heliosdb (DB)                  │
-│  put / get / delete / scan / flush             │
-│                                                │
-│  ┌──────────────┐   ┌──────────────────────┐  │
-│  │  MemTable    │   │  ActiveSegment        │  │
-│  │  (skip list) │   │  (one SST, all live   │  │
-│  │              │   │   keys, latest ver.)  │  │
-│  └──────┬───────┘   └──────────┬───────────┘  │
-│         │  flush                │ seal          │
-│         └──────────────────────▼              │
-│                         InactiveSegments       │
-│                         (historical, bloom-    │
-│                          filtered reads)       │
-│                                                │
-│  ┌──────────────┐   ┌──────────────────────┐  │
-│  │  WAL         │   │  Manifest            │  │
-│  │  (crash      │   │  (version edits,     │  │
-│  │   recovery)  │   │   file membership)   │  │
-│  └──────────────┘   └──────────────────────┘  │
-└────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                     heliosdb (DB)                        │
+│  put / get / delete / scan / flush                       │
+│                                                          │
+│  ┌──────────────┐   ┌─────────────────────────────────┐  │
+│  │  MemTableSet │   │  Level-0 SST files              │  │
+│  │  active +    │──►│  (one per flush, newest-first   │  │
+│  │  immutables  │   │   reads, oldest-first scans)    │  │
+│  └──────────────┘   └─────────────────────────────────┘  │
+│         │ background flusher                             │
+│         │ (bounded channel)                              │
+│         ▼                                                │
+│  ┌──────────────┐   ┌──────────────────────────────────┐ │
+│  │  WAL         │   │  Manifest                        │ │
+│  │  (crash      │   │  (version edits, file membership)│ │
+│  │   recovery)  │   │                                  │ │
+│  └──────────────┘   └──────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────┘
 ```
 
-## Key invariant
+## Flush model
 
-> The active segment always contains the latest version of every currently-live key.
+Each sealed memtable is written to its own SST file (no merge with
+existing SSTs). This keeps the flush path simple and fast — the
+background flusher just serializes the memtable entries and registers the
+new file in the manifest.
 
-This invariant is established by the flush pipeline and never broken:
-- Every `put` lands in the MemTable.
-- Every flush merges the MemTable **into** the active segment (not alongside it).
-- The result is a new active segment with up-to-date values for all keys.
+Multiple level-0 SSTs can have overlapping key ranges. The read path
+handles this by checking them in recency order (newest first for point
+lookups, oldest first for scans with overwrites).
 
-Inactive segments hold historical data and overflow from older compaction cycles.
-They are never needed for current-snapshot reads unless a key is absent from the
-active segment — which the negative bloom filter catches cheaply.
+Compaction merges overlapping level-0 SSTs into non-overlapping higher
+levels, reducing read amplification over time.

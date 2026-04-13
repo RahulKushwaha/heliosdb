@@ -36,11 +36,7 @@ pub trait MemTable: Default + Send + Sync {
 ```rust
 pub struct DB<M = SkipListMemTable> { ... }
 
-// Use the default:
 let db = DB::<SkipListMemTable>::open("/tmp/db", opts)?;
-
-// Or plug in your own implementation:
-let db = DB::<MyMemTable>::open("/tmp/db", opts)?;
 ```
 
 ---
@@ -56,7 +52,6 @@ started. The `get` implementation returns the latest version of a key whose
 probe trick:
 
 ```rust
-// Probe sits at the boundary: "first entry with seq_num <= read_seq"
 let probe = InternalKey::new_put(Bytes::copy_from_slice(user_key), read_seq);
 ```
 
@@ -73,16 +68,10 @@ enabling consistent point-in-time reads even under concurrent writes.
 Backed by `crossbeam_skiplist::SkipMap`. Readers and writers never block each
 other — the skip list uses epoch-based lock-free concurrency.
 
-**Strengths**: fast negative lookups (the hot path when a key has been flushed
-to the active segment); readers and writers run concurrently.
+**Strengths**: fast negative lookups; readers and writers run concurrently.
 
 **Weakness**: epoch-based memory reclamation adds overhead to iteration
 (the flush path).
-
-```rust
-let mt = SkipListMemTable::new();
-mt.put(Bytes::from("hello"), 1, Bytes::from("world"));
-```
 
 ---
 
@@ -91,16 +80,10 @@ mt.put(Bytes::from("hello"), 1, Bytes::from("world"));
 Backed by `parking_lot::RwLock<BTreeMap<InternalKey, Value>>`.
 
 **Strengths**: iteration is ~2.4× faster than the skip list (contiguous memory,
-no pointer-chasing) — important for the flush pipeline. Deletes are also
-slightly faster.
+no pointer-chasing) — important for the flush pipeline.
 
 **Weakness**: reads and writes are mutually exclusive (write lock excludes all
 readers); negative lookups are ~2× slower than the skip list.
-
-```rust
-let mt = BTreeMemTable::new();
-mt.put(Bytes::from("hello"), 1, Bytes::from("world"));
-```
 
 ### Benchmark comparison (100k entries)
 
@@ -112,7 +95,7 @@ mt.put(Bytes::from("hello"), 1, Bytes::from("world"));
 | Delete | 74 ms | 72 ms | BTree ~3% |
 | Iter (flush) | 18.5 ms | 10.7 ms | BTree 2.4× |
 
-Choose **SkipList** for read-heavy or mixed workloads.  
+Choose **SkipList** for read-heavy or mixed workloads.
 Choose **BTree** if flush throughput is the bottleneck.
 
 ---
@@ -125,49 +108,53 @@ Choose **BTree** if flush throughput is the bottleneck.
 
 ```
 writes ──► [ active: M ]
-                 │  size >= write_buffer_size → rotate()
+                 │  size >= write_buffer_size → rotate_arc()
                  ▼
-          [ immutable[n] ]  ← newest
+          [ immutable[n] ]  ← newest (Arc<M>)
           [ immutable[1] ]
           [ immutable[0] ]  ← oldest, flushed first
-                 │  pop_oldest_immutable()
+                 │  bounded channel → flusher thread
                  ▼
-          flush pipeline → SST
+           L0 SST on disk
 ```
 
 ```rust
 pub struct MemTableSet<M> {
     active:           M,
-    immutable:        VecDeque<M>,  // front = oldest, back = newest
+    immutable:        VecDeque<Arc<M>>,  // front = oldest, back = newest
     write_buffer_size: usize,
     max_immutable:    usize,
 }
 ```
 
+Immutable memtables are stored as `Arc<M>` so they can be shared between
+the read path (VecDeque) and the background flusher (channel) without
+copying.
+
 ### Rotation
 
-When `active.size_bytes() >= write_buffer_size`, the active memtable is
-**sealed**: moved into the immutable queue and replaced with a fresh `M::default()`.
-This is `rotate()`.
+When `active.size_bytes() >= write_buffer_size`, the write path calls
+`rotate_arc()`:
 
-If the immutable queue is already at `max_immutable` when a rotation is
-needed, the oldest immutable is flushed to SST first to make room. This is
-the **backpressure point** — writes stall here, and only here, until the
-flush completes.
+1. Seal the active memtable → `Arc<M>`.
+2. Push the Arc to the immutable VecDeque (stays readable).
+3. Return the Arc to the caller (for sending to the flusher channel).
+4. Replace `active` with a fresh `M::default()`.
+
+The write lock is released **before** the channel send. If the channel is
+full (capacity = `max_immutable_count`), the writer blocks — this is the
+**backpressure point**, and no lock is held during the wait.
+
+### Background flusher
+
+A dedicated `helios-flusher` thread receives sealed `Arc<M>` from the
+bounded channel and writes each one to a new level-0 SST file:
 
 ```
-write → should_rotate?
-              │ yes
-              ▼
-        is_at_capacity?
-         │ yes        │ no
-         ▼            ▼
-   flush_oldest    rotate()
-    _immutable()
-         │
-         ▼
-       rotate()
+recv(Arc<M>) → write lock → pop oldest immutable → write SST → register
 ```
+
+Each flush creates a standalone SST — no merging with existing files.
 
 ### Read path
 
@@ -184,13 +171,11 @@ in any immutable below it.
 
 Rotating the active memtable into the immutable queue does **not** rotate the
 WAL. The WAL continues to cover all writes across every immutable and the
-active memtable. The WAL is only truncated during a full `db.flush()`, after
-every immutable has been persisted to SST and no in-memory data remains
-unprotected.
+active memtable. The WAL is only truncated during an explicit `db.flush()`,
+after every immutable has been flushed to SST.
 
 On crash recovery, all WAL entries are replayed into a single fresh active
-memtable. The immutable queue always starts empty — recovery does not
-reconstruct the pre-crash queue state.
+memtable. The immutable queue always starts empty.
 
 ### `Options`
 
@@ -199,7 +184,8 @@ pub struct Options {
     /// Seal the active memtable at this size. Default: 64 MiB.
     pub write_buffer_size: usize,
 
-    /// Maximum immutable memtables before writes stall. Default: 2.
+    /// Bounded channel capacity / max immutable memtables.
+    /// Writers block when this many sealed memtables are pending. Default: 2.
     pub max_immutable_count: usize,
 
     pub compression: CompressionType,
@@ -207,5 +193,4 @@ pub struct Options {
 ```
 
 With `max_immutable_count = 2`, heliosDB can absorb two full write buffers
-before stalling — giving the flush pipeline time to catch up without blocking
-the application.
+before stalling — giving the flusher thread time to catch up.

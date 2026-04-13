@@ -1,83 +1,58 @@
 # Active / Inactive Separation
 
-This is the central design idea inherited from Google Ressi.
+## Background
 
-## The problem with standard LSM scans
+heliosDB's flush model is inspired by Google Ressi's single-authoritative-file
+idea but currently uses a simpler approach: each memtable flush writes a
+separate level-0 SST file. Compaction later merges overlapping L0 files
+into non-overlapping higher levels.
 
-In a standard LSM tree (LevelDB, RocksDB), a scan must merge-iterate across
-every level simultaneously — MemTable, L0 files (which can overlap), L1, L2, ...
-The merge fan-in is `O(L0_files + num_levels)`. With 4 L0 files and 6 levels,
-that's 10 concurrent merge streams for every single scan.
-
-More critically, the merge iterator must compare sequence numbers on every key to
-figure out which version wins. This is pure CPU overhead for the common case
-where you just want the latest value.
-
-## The Ressi solution: one authoritative file
-
-heliosDB maintains exactly one **active segment** that is the sole authoritative
-source for current values:
+## Flush pipeline
 
 ```
-Active Segment
-┌─────────────────────────────────────┐
-│  "apple"  → "fruit"    (seq=1042)  │
-│  "banana" → "yellow"   (seq=997)   │
-│  "cherry" → "red"      (seq=1051)  │
-│  ...                               │
-│  (sorted, latest version per key)  │
-└─────────────────────────────────────┘
-
-Inactive Segments (historical only)
-┌──────────────┐  ┌──────────────┐
-│  L1 file     │  │  L2 file     │
-│  (older ver) │  │  (older ver) │
-└──────────────┘  └──────────────┘
+MemTable full
+  │
+  ├─ rotate_arc()
+  │    Seal active memtable → Arc<M>
+  │    Push to immutable VecDeque (reads) + bounded channel (flusher)
+  │
+  └─ flusher thread
+       Pop from channel → write entries to new L0 SST
+       Register in manifest (AddInactive level=0)
 ```
 
-A scan for current values:
-1. Iterate the active segment sequentially — **one file, one pass**.
-2. For keys absent from the active, consult inactive segments.
-   Each inactive segment's bloom filter answers "is this key definitely NOT here?"
-   Most lookups are skipped entirely.
+Each flush creates a standalone SST — no merging with existing files.
+This keeps the flush path simple and predictable.
 
-## Scan complexity comparison
+## Level-0 overlap
 
-| Approach | Scan streams |
-|---|---|
-| Standard LSM (L0=4, 6 levels) | ≤10 merge streams |
-| heliosDB (active/inactive) | 1 active + targeted gap-fills |
-
-For a full-keyspace scan where every key is live, the inactive segments are
-never consulted at all — it's a single sequential read of the active segment.
-
-## The flush invariant
-
-The invariant is maintained by the flush pipeline:
+Unlike higher levels, level-0 SSTs can have overlapping key ranges
+because each one is an independent memtable snapshot:
 
 ```
-Old state:
-  active = { a→v1, b→v2 }
-  MemTable = { b→v3, c→v4 }   ← b was updated
-
-Flush merge:
-  MergeIterator(MemTable priority=0, active priority=1)
-  → a→v1  (only in active)
-  → b→v3  (MemTable wins, higher seq_num)
-  → c→v4  (only in MemTable)
-
-New state:
-  active = { a→v1, b→v3, c→v4 }   ← invariant restored
-  old active file deleted
+L0 SST #3 (newest):  [apple..cherry]   ← delete banana
+L0 SST #2:           [banana..fig]     ← put banana=yellow
+L0 SST #1 (oldest):  [apple..date]     ← put apple=fruit
 ```
+
+The read path handles this:
+- **Point lookups** iterate L0 SSTs newest-first, stopping at the first
+  match (including tombstones).
+- **Scans** iterate L0 SSTs oldest-first; each layer overwrites the
+  previous, so the newest version wins.
 
 ## Bloom filter as a negative existence filter
 
-Inactive segment bloom filters are indexed by user key. The query
-`definitely_not_here(key)` returns `true` when the key is provably absent from
-that inactive file. This allows the read path to skip most inactive segments
-without any disk I/O.
+Inactive segment bloom filters are indexed by the full encoded InternalKey.
+For level-0 SSTs created by the flush pipeline, point lookups scan entries
+directly rather than relying on the bloom filter (since the filter is keyed
+on InternalKey encoding, not raw user keys).
 
-False negatives are impossible by Bloom filter construction — if a key is in the
-file, the filter always says "might be here". Only false positives (unnecessary
-reads) can occur, at a tunable ~1% rate.
+Higher-level segments (produced by compaction) use bloom filters effectively
+to skip segments that definitely don't contain a given key.
+
+## Compaction
+
+Compaction reduces L0 overlap by merging multiple L0 SSTs into larger,
+non-overlapping higher-level files. This improves read performance over
+time by reducing the number of files that must be checked.
