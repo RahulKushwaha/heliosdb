@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use heliosdb_types::{InternalKey, SeqNum, UserKey, Value};
 
@@ -18,8 +19,8 @@ use super::traits::{GetResult, MemTable};
 ///         immutable[0]  ← oldest, flushed first
 /// ```
 ///
-/// When `immutable.len() == max_immutable` the caller must flush the oldest
-/// immutable before rotating again (backpressure).
+/// Immutable memtables are stored as `Arc<M>` so they can be shared with the
+/// background flusher thread without holding the main write lock.
 ///
 /// ## WAL safety
 ///
@@ -27,12 +28,12 @@ use super::traits::{GetResult, MemTable};
 /// The WAL continues to cover all writes for both the active and every
 /// immutable memtable. Only after all immutables have been flushed to SST
 /// and the active is empty is it safe to truncate the WAL — the caller
-/// (`DB::flush_locked`) is responsible for that step.
+/// (`DB::flush`) is responsible for that step.
 pub struct MemTableSet<M> {
     /// Receives all new writes.
     active: M,
     /// Sealed memtables awaiting flush.  Front = oldest, back = newest.
-    immutable: VecDeque<M>,
+    immutable: VecDeque<Arc<M>>,
     /// Seal the active when its size exceeds this threshold.
     write_buffer_size: usize,
     /// Maximum length of the immutable queue before writes must stall.
@@ -81,7 +82,6 @@ impl<M: MemTable> MemTableSet<M> {
     }
 
     /// True when the immutable queue is full.
-    /// The caller must flush the oldest immutable before calling `rotate`.
     pub fn is_at_capacity(&self) -> bool {
         self.immutable.len() >= self.max_immutable
     }
@@ -95,8 +95,19 @@ impl<M: MemTable> MemTableSet<M> {
             "MemTableSet::rotate called while at capacity ({} immutables); flush first",
             self.immutable.len()
         );
-        let old = std::mem::replace(&mut self.active, M::default());
-        self.immutable.push_back(old);
+        let _ = self.rotate_arc();
+    }
+
+    /// Seal the active memtable, store it in the immutable queue for reads,
+    /// and return an `Arc` so the caller can send it to the flush pipeline.
+    ///
+    /// Does NOT check capacity — backpressure is the caller's responsibility
+    /// (e.g., a bounded channel).
+    pub fn rotate_arc(&mut self) -> Arc<M> {
+        let sealed = std::mem::replace(&mut self.active, M::default());
+        let arc = Arc::new(sealed);
+        self.immutable.push_back(Arc::clone(&arc));
+        arc
     }
 
     // -----------------------------------------------------------------------
@@ -104,7 +115,7 @@ impl<M: MemTable> MemTableSet<M> {
     // -----------------------------------------------------------------------
 
     /// Remove and return the oldest immutable memtable for flushing to SST.
-    pub fn pop_oldest_immutable(&mut self) -> Option<M> {
+    pub fn pop_oldest_immutable(&mut self) -> Option<Arc<M>> {
         self.immutable.pop_front()
     }
 
@@ -221,5 +232,17 @@ mod tests {
         let mut set: MemTableSet<SkipListMemTable> = MemTableSet::new(4096, 1);
         set.put(key("k"), 1, val("v")); set.rotate(); // fills the 1 slot
         set.put(key("k"), 2, val("v")); set.rotate(); // should panic
+    }
+
+    #[test]
+    fn rotate_arc_returns_shared_arc() {
+        let mut set: MemTableSet<SkipListMemTable> = MemTableSet::new(4096, 4);
+        set.put(key("k"), 1, val("v1"));
+        let arc = set.rotate_arc();
+        // Arc is readable
+        assert!(matches!(arc.get(b"k", 1), Some(GetResult::Value(v)) if v == val("v1")));
+        // Also readable through the VecDeque (for DB reads during flush)
+        assert!(matches!(set.get(b"k", 1), Some(GetResult::Value(v)) if v == val("v1")));
+        assert_eq!(set.immutable_count(), 1);
     }
 }

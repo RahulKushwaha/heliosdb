@@ -1,17 +1,26 @@
 //! Top-level DB struct — coordinates MemTableSet, WAL, ActiveSegment,
 //! InactiveSegments, Manifest, and Compaction.
+//!
+//! A background **flusher thread** drains the immutable memtable queue
+//! asynchronously. A bounded `crossbeam_channel` acts as the ring-buffer
+//! between the write path and the flusher, providing natural backpressure
+//! (send blocks when full) without holding any lock.
 
 use std::{
     io::Cursor,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    thread::JoinHandle,
 };
 
 use bytes::Bytes;
+use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::RwLock;
 
 use heliosdb_engine::{
-    compaction::Compactor,
     iterator::MergeIterator,
     manifest::{Edit, Manifest, VersionSet},
     memtable::{GetResult, MemTable, MemTableSet, SkipListMemTable},
@@ -41,14 +50,31 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            write_buffer_size:  DEFAULT_WRITE_BUFFER_SIZE,
+            write_buffer_size:   DEFAULT_WRITE_BUFFER_SIZE,
             max_immutable_count: DEFAULT_MAX_IMMUTABLE,
-            compression:        CompressionType::None,
+            compression:         CompressionType::None,
         }
     }
 }
 
-/// Internal mutable state, protected by a single RwLock.
+// ---------------------------------------------------------------------------
+// Flush pipeline message
+// ---------------------------------------------------------------------------
+
+/// Message sent from the write path to the background flusher.
+enum FlushMsg<M> {
+    /// A sealed memtable to flush to SST.
+    Sealed(Arc<M>),
+    /// Synchronisation barrier: the flusher sends `()` on the ack channel
+    /// after it has processed every `Sealed` message that preceded this one.
+    FlushAll(Sender<()>),
+}
+
+// ---------------------------------------------------------------------------
+// Internal mutable state
+// ---------------------------------------------------------------------------
+
+/// State protected by a single RwLock.
 struct DbState<M> {
     memtable_set: MemTableSet<M>,
     active:       Option<ActiveSegment>,
@@ -58,14 +84,24 @@ struct DbState<M> {
     wal:          Wal,
 }
 
-pub struct DB<M = SkipListMemTable> {
+/// Shared inner state, accessible from both `DB` and the flusher thread.
+struct DbInner<M> {
     dir:      PathBuf,
     opts:     Options,
     next_seq: AtomicU64,
     state:    RwLock<DbState<M>>,
 }
 
-impl<M: MemTable> DB<M> {
+pub struct DB<M = SkipListMemTable> {
+    inner:    Arc<DbInner<M>>,
+    /// Sole sender for the flush ring-buffer.  Dropping this closes the
+    /// channel, which causes the flusher thread to exit.
+    flush_tx: Sender<FlushMsg<M>>,
+    /// Background flusher thread handle.
+    flusher:  Option<JoinHandle<()>>,
+}
+
+impl<M: MemTable + 'static> DB<M> {
     /// Open (or create) a heliosDB at `dir`.
     pub fn open(dir: impl AsRef<Path>, opts: Options) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
@@ -82,8 +118,6 @@ impl<M: MemTable> DB<M> {
         let manifest = Manifest::open(&manifest_path)?;
 
         // Replay WAL into a temporary memtable, then hand it to MemTableSet.
-        // All replayed entries land in the active slot; the immutable queue
-        // starts empty regardless of what was in flight before the crash.
         let recovered: M = M::default();
         Wal::replay(&wal_path, |key, value| {
             let seq = key.seq_num;
@@ -116,7 +150,7 @@ impl<M: MemTable> DB<M> {
 
         let wal = Wal::open(&wal_path)?;
 
-        Ok(Self {
+        let inner = Arc::new(DbInner {
             dir,
             opts,
             next_seq,
@@ -128,6 +162,24 @@ impl<M: MemTable> DB<M> {
                 version,
                 wal,
             }),
+        });
+
+        // Bounded channel: capacity = max_immutable_count.
+        // send() blocks when full → backpressure without holding any lock.
+        let (flush_tx, flush_rx) = bounded(inner.opts.max_immutable_count);
+
+        let flusher_inner = Arc::clone(&inner);
+        let flusher = std::thread::Builder::new()
+            .name("helios-flusher".into())
+            .spawn(move || flusher_loop(flusher_inner, flush_rx))
+            .map_err(|e| heliosdb_types::HeliosError::InvalidArgument(
+                format!("failed to spawn flusher thread: {e}"),
+            ))?;
+
+        Ok(Self {
+            inner,
+            flush_tx,
+            flusher: Some(flusher),
         })
     }
 
@@ -136,40 +188,55 @@ impl<M: MemTable> DB<M> {
     // -----------------------------------------------------------------------
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let seq   = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let seq   = self.inner.next_seq.fetch_add(1, Ordering::Relaxed);
         let ikey  = InternalKey::new_put(Bytes::copy_from_slice(key), seq);
         let value = Bytes::copy_from_slice(value);
 
-        let mut state = self.state.write();
-        state.wal.append(&ikey, &value)?;
-        state.memtable_set.put(ikey.user_key, seq, value);
+        // Hold write lock only for WAL + memtable + rotation decision.
+        let sealed = {
+            let mut state = self.inner.state.write();
+            state.wal.append(&ikey, &value)?;
+            state.memtable_set.put(ikey.user_key, seq, value);
+            if state.memtable_set.should_rotate() {
+                Some(state.memtable_set.rotate_arc())
+            } else {
+                None
+            }
+        }; // ← write lock released
 
-        self.maybe_rotate(&mut state)?;
+        // Channel send (may block if ring-buffer full — backpressure).
+        if let Some(arc) = sealed {
+            self.flush_tx
+                .send(FlushMsg::Sealed(arc))
+                .map_err(|_| heliosdb_types::HeliosError::InvalidArgument(
+                    "flusher thread died".into(),
+                ))?;
+        }
         Ok(())
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        let seq  = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let seq  = self.inner.next_seq.fetch_add(1, Ordering::Relaxed);
         let ikey = InternalKey::new_delete(Bytes::copy_from_slice(key), seq);
 
-        let mut state = self.state.write();
-        state.wal.append(&ikey, &Bytes::new())?;
-        state.memtable_set.delete(ikey.user_key, seq);
+        let sealed = {
+            let mut state = self.inner.state.write();
+            state.wal.append(&ikey, &Bytes::new())?;
+            state.memtable_set.delete(ikey.user_key, seq);
+            if state.memtable_set.should_rotate() {
+                Some(state.memtable_set.rotate_arc())
+            } else {
+                None
+            }
+        };
 
-        self.maybe_rotate(&mut state)?;
-        Ok(())
-    }
-
-    /// Check after every write: if the active memtable has hit the threshold,
-    /// flush the oldest immutable (if queue is full) then rotate.
-    fn maybe_rotate(&self, state: &mut DbState<M>) -> Result<()> {
-        if !state.memtable_set.should_rotate() {
-            return Ok(());
+        if let Some(arc) = sealed {
+            self.flush_tx
+                .send(FlushMsg::Sealed(arc))
+                .map_err(|_| heliosdb_types::HeliosError::InvalidArgument(
+                    "flusher thread died".into(),
+                ))?;
         }
-        if state.memtable_set.is_at_capacity() {
-            self.flush_oldest_immutable_locked(state)?;
-        }
-        state.memtable_set.rotate();
         Ok(())
     }
 
@@ -178,8 +245,8 @@ impl<M: MemTable> DB<M> {
     // -----------------------------------------------------------------------
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let read_seq = self.next_seq.load(Ordering::Relaxed);
-        let mut state = self.state.write();
+        let read_seq = self.inner.next_seq.load(Ordering::Relaxed);
+        let mut state = self.inner.state.write();
 
         // 1. MemTableSet: active → immutables newest → oldest
         match state.memtable_set.get(key, read_seq) {
@@ -207,11 +274,11 @@ impl<M: MemTable> DB<M> {
     }
 
     pub fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
-        let read_seq = self.next_seq.load(Ordering::Relaxed);
+        let read_seq = self.inner.next_seq.load(Ordering::Relaxed);
         let mut results: std::collections::BTreeMap<Bytes, Bytes> =
             std::collections::BTreeMap::new();
 
-        let mut state = self.state.write();
+        let mut state = self.inner.state.write();
 
         // 1. Inactive segments (lowest priority)
         for inactive in &mut state.inactive {
@@ -248,7 +315,6 @@ impl<M: MemTable> DB<M> {
         }
 
         // 3. MemTableSet sources: oldest immutable → newest → active
-        //    Each overwrites the previous, so active ends up highest priority.
         for entries in state.memtable_set.iter_all_by_priority() {
             for (ikey, val) in entries {
                 if ikey.seq_num > read_seq { continue; }
@@ -267,70 +333,55 @@ impl<M: MemTable> DB<M> {
     }
 
     // -----------------------------------------------------------------------
-    // Flush
+    // Flush (explicit / public)
     // -----------------------------------------------------------------------
 
-    /// Flush one immutable memtable into the active SST.
-    /// Does NOT rotate the WAL — the WAL still covers the remaining
-    /// immutables and the current active memtable.
-    fn flush_oldest_immutable_locked(&self, state: &mut DbState<M>) -> Result<()> {
-        let oldest = match state.memtable_set.pop_oldest_immutable() {
-            Some(m) => m,
-            None    => return Ok(()),
-        };
-
-        let new_active_path = self.new_active_path();
-
-        // Collect old active SST entries (lower priority than the immutable).
-        let (old_active_path, active_entries) = self.drain_active_sst(state)?;
-
-        // Merge: immutable (priority 0) beats old active SST (priority 1).
-        let mem_iter: Box<dyn Iterator<Item = (InternalKey, Bytes)> + Send> =
-            Box::new(oldest.iter().into_iter());
-        let sst_iter: Box<dyn Iterator<Item = (InternalKey, Bytes)> + Send> =
-            Box::new(active_entries.into_iter());
-        let merged = MergeIterator::new(vec![mem_iter, sst_iter]);
-
-        let expected = (oldest.size_bytes() / 64).max(64);
-        self.write_sst(&new_active_path, merged, expected)?;
-
-        if let Some(ref p) = old_active_path { let _ = std::fs::remove_file(p); }
-        self.promote_active(state, new_active_path)?;
-
-        Ok(())
-    }
-
-    /// Full flush: seal the active memtable, drain the entire immutable queue,
-    /// then rotate the WAL (now safe — all data is persisted in SST).
-    fn flush_locked(&self, state: &mut DbState<M>) -> Result<()> {
-        // Seal the active memtable if it has data.
-        if !state.memtable_set.active_is_empty() {
-            if state.memtable_set.is_at_capacity() {
-                self.flush_oldest_immutable_locked(state)?;
+    /// Force a full flush: seal the active memtable, wait for the background
+    /// flusher to drain every pending immutable, then truncate the WAL.
+    pub fn flush(&self) -> Result<()> {
+        // Rotate active into the flush pipeline if it has data.
+        let sealed = {
+            let mut state = self.inner.state.write();
+            if !state.memtable_set.active_is_empty() {
+                Some(state.memtable_set.rotate_arc())
+            } else {
+                None
             }
-            state.memtable_set.rotate();
+        };
+        if let Some(arc) = sealed {
+            self.flush_tx
+                .send(FlushMsg::Sealed(arc))
+                .map_err(|_| heliosdb_types::HeliosError::InvalidArgument(
+                    "flusher thread died".into(),
+                ))?;
         }
 
-        // Flush every immutable in order (oldest first).
-        while state.memtable_set.immutable_count() > 0 {
-            self.flush_oldest_immutable_locked(state)?;
-        }
+        // Send a barrier and wait for the flusher to process everything
+        // that precedes it (channel is FIFO).
+        let (ack_tx, ack_rx) = bounded(1);
+        self.flush_tx
+            .send(FlushMsg::FlushAll(ack_tx))
+            .map_err(|_| heliosdb_types::HeliosError::InvalidArgument(
+                "flusher thread died".into(),
+            ))?;
+        ack_rx
+            .recv()
+            .map_err(|_| heliosdb_types::HeliosError::InvalidArgument(
+                "flusher thread died".into(),
+            ))?;
 
         // All data is now in SST — safe to truncate the WAL.
-        state.wal = Wal::create(&self.dir.join("WAL"))?;
+        let mut state = self.inner.state.write();
+        state.wal = Wal::create(&self.inner.dir.join("WAL"))?;
         Ok(())
     }
+}
 
-    /// Force a full flush even if the memtable hasn't hit the size limit.
-    pub fn flush(&self) -> Result<()> {
-        let mut state = self.state.write();
-        self.flush_locked(&mut state)
-    }
+// ---------------------------------------------------------------------------
+// DbInner helpers (used by both DB methods and the flusher thread)
+// ---------------------------------------------------------------------------
 
-    // -----------------------------------------------------------------------
-    // Flush helpers
-    // -----------------------------------------------------------------------
-
+impl<M: MemTable> DbInner<M> {
     fn new_active_path(&self) -> PathBuf {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -385,6 +436,83 @@ impl<M: MemTable> DB<M> {
         })?;
         state.version.set_active(path);
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background flusher
+// ---------------------------------------------------------------------------
+
+/// Main loop for the background flusher thread.
+///
+/// Receives sealed memtables over a bounded channel and flushes them to SST.
+/// The channel acts as a ring-buffer: capacity = `max_immutable_count`.
+/// Exits when the channel is closed (all senders dropped → `DB::drop`).
+fn flusher_loop<M: MemTable>(inner: Arc<DbInner<M>>, rx: Receiver<FlushMsg<M>>) {
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            FlushMsg::Sealed(sealed) => {
+                if let Err(e) = flush_one(&inner, &sealed) {
+                    tracing::error!("background flush failed: {e}");
+                }
+            }
+            FlushMsg::FlushAll(ack) => {
+                // Channel is FIFO — all prior Sealed messages have already
+                // been processed by the time we see this barrier.
+                let _ = ack.send(());
+            }
+        }
+    }
+    tracing::debug!("flusher thread exiting");
+}
+
+/// Flush a single sealed memtable into the active SST.
+///
+/// Holds the write lock for the entire operation so that reads never see a
+/// window where `state.active` has been drained but the new SST hasn't been
+/// promoted yet.  The background thread's value is that **writers don't do
+/// the flush inline** — `put()` returns immediately after the channel send,
+/// and the flusher does the work in a separate thread.
+fn flush_one<M: MemTable>(inner: &DbInner<M>, sealed: &Arc<M>) -> Result<()> {
+    let mut state = inner.state.write();
+
+    let new_path = inner.new_active_path();
+    let (old_active_path, active_entries) = inner.drain_active_sst(&mut state)?;
+
+    // Merge: immutable (priority 0) beats old active SST (priority 1).
+    let mem_iter: Box<dyn Iterator<Item = (InternalKey, Bytes)> + Send> =
+        Box::new(sealed.iter().into_iter());
+    let sst_iter: Box<dyn Iterator<Item = (InternalKey, Bytes)> + Send> =
+        Box::new(active_entries.into_iter());
+    let merged = MergeIterator::new(vec![mem_iter, sst_iter]);
+
+    let expected = (sealed.size_bytes() / 64).max(64);
+    inner.write_sst(&new_path, merged, expected)?;
+
+    state.memtable_set.pop_oldest_immutable();
+    if let Some(ref p) = old_active_path {
+        let _ = std::fs::remove_file(p);
+    }
+    inner.promote_active(&mut state, new_path)?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Clean shutdown
+// ---------------------------------------------------------------------------
+
+impl<M> Drop for DB<M> {
+    fn drop(&mut self) {
+        // Replace flush_tx with a dummy sender, dropping the real one.
+        // This closes the channel → flusher's recv() returns Err → loop exits.
+        let (_dummy_tx, _dummy_rx) = bounded(0);
+        let _ = std::mem::replace(&mut self.flush_tx, _dummy_tx);
+
+        // Wait for the flusher to finish processing any in-flight messages.
+        if let Some(handle) = self.flusher.take() {
+            let _ = handle.join();
+        }
     }
 }
 

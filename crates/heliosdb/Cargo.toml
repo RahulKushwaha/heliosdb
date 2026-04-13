@@ -10,6 +10,7 @@ heliosdb-engine = { workspace = true }
 bytes           = { workspace = true }
 parking_lot     = { workspace = true }
 tracing         = { workspace = true }
+crossbeam-channel = { workspace = true }
 
 [dev-dependencies]
 tempfile             = "3"
