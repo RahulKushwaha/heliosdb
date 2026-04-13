@@ -4,6 +4,7 @@ members = [
     "crates/heliosdb-sst",
     "crates/heliosdb-engine",
     "crates/heliosdb",
+    "crates/heliosdb-oracle",
 ]
 resolver = "2"
 
@@ -15,8 +16,12 @@ tracing     = "0.1"
 parking_lot = "0.12"
 crossbeam-skiplist = "0.1"
 crossbeam-channel  = "0.5"
+rocksdb            = "0.24"
 snap        = "1"
 zstd        = "0.13"
+
+[workspace.dependencies.heliosdb]
+path = "crates/heliosdb"
 
 [workspace.dependencies.heliosdb-types]
 path = "crates/heliosdb-types"
