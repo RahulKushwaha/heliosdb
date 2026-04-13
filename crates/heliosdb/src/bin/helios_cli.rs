@@ -7,7 +7,7 @@
 //!   helios_cli <db_dir> scan <start> <end>
 //!   helios_cli <db_dir> flush
 
-use heliosdb::{Options, DB};
+use heliosdb::{Options, SkipListMemTable, DB};
 
 fn main() -> heliosdb::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -18,7 +18,7 @@ fn main() -> heliosdb::Result<()> {
 
     let db_dir = &args[1];
     let cmd    = &args[2];
-    let db     = DB::open(db_dir, Options::default())?;
+    let db     = DB::<SkipListMemTable>::open(db_dir, Options::default())?;
 
     match cmd.as_str() {
         "put" => {

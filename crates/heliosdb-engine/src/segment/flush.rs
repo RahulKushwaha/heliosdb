@@ -29,13 +29,13 @@ use crate::{
 ///
 /// Returns `(new_active, sealed_inactive)`.
 pub fn flush(
-    memtable: &MemTable,
+    memtable: &impl MemTable,
     old_active: Option<ActiveSegment>,
     new_active_path: impl AsRef<Path>,
     inactive_path: impl AsRef<Path>,
 ) -> Result<(ActiveSegment, Option<InactiveSegment>)> {
     // --- collect sources ---
-    let mem_entries: Vec<(InternalKey, Bytes)> = memtable.iter().into_iter().collect();
+    let mem_entries: Vec<(InternalKey, Bytes)> = memtable.iter();
     let mem_iter: Box<dyn Iterator<Item = (InternalKey, Bytes)> + Send> =
         Box::new(mem_entries.into_iter());
 
@@ -89,7 +89,7 @@ pub fn flush(
 
 /// Simpler flush: just write the MemTable to a new SST, no prior active segment.
 pub fn flush_memtable_only(
-    memtable: &MemTable,
+    memtable: &impl MemTable,
     new_active_path: impl AsRef<Path>,
     compression: CompressionType,
 ) -> Result<ActiveSegment> {
@@ -97,7 +97,7 @@ pub fn flush_memtable_only(
     let expected = (memtable.size_bytes() / 64).max(64);
     let mut builder = SstBuilder::new(Cursor::new(&mut buf), expected, compression);
 
-    for (ikey, value) in memtable.iter().into_iter() {
+    for (ikey, value) in memtable.iter() {
         let enc_key = ikey.encode();
         builder.add(&enc_key, &value)?;
     }
@@ -110,13 +110,14 @@ pub fn flush_memtable_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memtable::SkipListMemTable;
     use bytes::Bytes;
     use tempfile::tempdir;
 
     #[test]
     fn flush_memtable_creates_active_segment() {
         let dir = tempdir().unwrap();
-        let mt = MemTable::new();
+        let mt = SkipListMemTable::new();
         mt.put(Bytes::from("apple"), 1, Bytes::from("fruit"));
         mt.put(Bytes::from("banana"), 2, Bytes::from("yellow"));
 

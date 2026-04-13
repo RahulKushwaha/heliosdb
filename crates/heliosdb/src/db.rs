@@ -1,4 +1,4 @@
-//! Top-level DB struct — coordinates MemTable, WAL, ActiveSegment,
+//! Top-level DB struct — coordinates MemTableSet, WAL, ActiveSegment,
 //! InactiveSegments, Manifest, and Compaction.
 
 use std::{
@@ -14,20 +14,26 @@ use heliosdb_engine::{
     compaction::Compactor,
     iterator::MergeIterator,
     manifest::{Edit, Manifest, VersionSet},
-    memtable::{GetResult, MemTable},
+    memtable::{GetResult, MemTable, MemTableSet, SkipListMemTable},
     segment::{ActiveSegment, InactiveSegment},
     Wal,
 };
 use heliosdb_sst::{builder::SstBuilder, CompressionType};
 use heliosdb_types::{InternalKey, Result};
 
-/// Default MemTable size threshold before a flush is triggered (64 MiB).
-const DEFAULT_MEMTABLE_SIZE_LIMIT: usize = 64 * 1024 * 1024;
+/// Default write-buffer size: seal the active memtable at 64 MiB.
+const DEFAULT_WRITE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
+
+/// Default immutable queue depth.  Writes stall when this many sealed
+/// memtables are waiting to be flushed.
+const DEFAULT_MAX_IMMUTABLE: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Flush MemTable to disk when it exceeds this many bytes.
-    pub memtable_size_limit: usize,
+    /// Seal the active memtable when it exceeds this many bytes.
+    pub write_buffer_size: usize,
+    /// Maximum number of immutable memtables before writes stall.
+    pub max_immutable_count: usize,
     /// Compression codec for SST data blocks.
     pub compression: CompressionType,
 }
@@ -35,30 +41,31 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            memtable_size_limit: DEFAULT_MEMTABLE_SIZE_LIMIT,
-            compression: CompressionType::None,
+            write_buffer_size:  DEFAULT_WRITE_BUFFER_SIZE,
+            max_immutable_count: DEFAULT_MAX_IMMUTABLE,
+            compression:        CompressionType::None,
         }
     }
 }
 
 /// Internal mutable state, protected by a single RwLock.
-struct DbState {
-    memtable:         MemTable,
-    active:           Option<ActiveSegment>,
-    inactive:         Vec<InactiveSegment>,
-    manifest:         Manifest,
-    version:          VersionSet,
-    wal:              Wal,
+struct DbState<M> {
+    memtable_set: MemTableSet<M>,
+    active:       Option<ActiveSegment>,
+    inactive:     Vec<InactiveSegment>,
+    manifest:     Manifest,
+    version:      VersionSet,
+    wal:          Wal,
 }
 
-pub struct DB {
-    dir:     PathBuf,
-    opts:    Options,
+pub struct DB<M = SkipListMemTable> {
+    dir:      PathBuf,
+    opts:     Options,
     next_seq: AtomicU64,
-    state:   RwLock<DbState>,
+    state:    RwLock<DbState<M>>,
 }
 
-impl DB {
+impl<M: MemTable> DB<M> {
     /// Open (or create) a heliosDB at `dir`.
     pub fn open(dir: impl AsRef<Path>, opts: Options) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
@@ -68,35 +75,33 @@ impl DB {
         let wal_path      = dir.join("WAL");
 
         // Recover version set from manifest.
-        let version = Manifest::recover(&manifest_path)?;
+        let version  = Manifest::recover(&manifest_path)?;
         let next_seq = AtomicU64::new(version.next_seq().max(1));
 
         // Open or create manifest writer.
         let manifest = Manifest::open(&manifest_path)?;
 
-        // Replay WAL → MemTable.
-        let memtable = MemTable::new();
+        // Replay WAL into a temporary memtable, then hand it to MemTableSet.
+        // All replayed entries land in the active slot; the immutable queue
+        // starts empty regardless of what was in flight before the crash.
+        let recovered: M = M::default();
         Wal::replay(&wal_path, |key, value| {
             let seq = key.seq_num;
             match key.op_type {
-                heliosdb_types::OpType::Put => {
-                    memtable.put(key.user_key, seq, value);
-                }
-                heliosdb_types::OpType::Delete => {
-                    memtable.delete(key.user_key, seq);
-                }
+                heliosdb_types::OpType::Put    => recovered.put(key.user_key, seq, value),
+                heliosdb_types::OpType::Delete => recovered.delete(key.user_key, seq),
             }
-            // Advance next_seq past any replayed sequence numbers.
             let _ = next_seq.fetch_max(seq + 1, Ordering::Relaxed);
         })?;
+        let memtable_set = MemTableSet::with_active(
+            recovered,
+            opts.write_buffer_size,
+            opts.max_immutable_count,
+        );
 
         // Open active segment if one exists.
         let active = if let Some(p) = version.active_path() {
-            if p.exists() {
-                Some(ActiveSegment::open(p)?)
-            } else {
-                None
-            }
+            if p.exists() { Some(ActiveSegment::open(p)?) } else { None }
         } else {
             None
         };
@@ -116,7 +121,7 @@ impl DB {
             opts,
             next_seq,
             state: RwLock::new(DbState {
-                memtable,
+                memtable_set,
                 active,
                 inactive,
                 manifest,
@@ -131,67 +136,68 @@ impl DB {
     // -----------------------------------------------------------------------
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let ikey  = heliosdb_types::InternalKey::new_put(Bytes::copy_from_slice(key), seq);
+        let seq   = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let ikey  = InternalKey::new_put(Bytes::copy_from_slice(key), seq);
         let value = Bytes::copy_from_slice(value);
 
         let mut state = self.state.write();
         state.wal.append(&ikey, &value)?;
-        state.memtable.put(ikey.user_key, seq, value);
+        state.memtable_set.put(ikey.user_key, seq, value);
 
-        if state.memtable.size_bytes() >= self.opts.memtable_size_limit {
-            self.flush_locked(&mut state)?;
-        }
+        self.maybe_rotate(&mut state)?;
         Ok(())
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let ikey  = heliosdb_types::InternalKey::new_delete(Bytes::copy_from_slice(key), seq);
-        let empty = Bytes::new();
+        let seq  = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let ikey = InternalKey::new_delete(Bytes::copy_from_slice(key), seq);
 
         let mut state = self.state.write();
-        state.wal.append(&ikey, &empty)?;
-        state.memtable.delete(ikey.user_key, seq);
+        state.wal.append(&ikey, &Bytes::new())?;
+        state.memtable_set.delete(ikey.user_key, seq);
 
-        if state.memtable.size_bytes() >= self.opts.memtable_size_limit {
-            self.flush_locked(&mut state)?;
+        self.maybe_rotate(&mut state)?;
+        Ok(())
+    }
+
+    /// Check after every write: if the active memtable has hit the threshold,
+    /// flush the oldest immutable (if queue is full) then rotate.
+    fn maybe_rotate(&self, state: &mut DbState<M>) -> Result<()> {
+        if !state.memtable_set.should_rotate() {
+            return Ok(());
         }
+        if state.memtable_set.is_at_capacity() {
+            self.flush_oldest_immutable_locked(state)?;
+        }
+        state.memtable_set.rotate();
         Ok(())
     }
 
     // -----------------------------------------------------------------------
-    // Read path (Ressi active/inactive separation)
+    // Read path
     // -----------------------------------------------------------------------
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let read_seq = self.next_seq.load(Ordering::Relaxed);
-        let mut state = self.state.write(); // need &mut for segment readers
+        let mut state = self.state.write();
 
-        // 1. MemTable (most recent)
-        match state.memtable.get(key, read_seq) {
-            Some(GetResult::Value(v)) => return Ok(Some(v)),
+        // 1. MemTableSet: active → immutables newest → oldest
+        match state.memtable_set.get(key, read_seq) {
+            Some(GetResult::Value(v))  => return Ok(Some(v)),
             Some(GetResult::Tombstone) => return Ok(None),
             None => {}
         }
 
-        // 2. Active segment (authoritative for all live keys)
+        // 2. Active segment
         if let Some(ref mut active) = state.active {
-            // The active segment stores encoded InternalKeys as SST keys.
-            // We need to find the entry whose user_key == key.
-            // Use a bloom-safe seek: look for the raw encoded key prefix.
-            // Simplified: scan active for matching user_key prefix.
             if let Some(value) = active_get(active, key)? {
                 return Ok(Some(value));
             }
         }
 
-        // 3. Inactive segments (fill in for historical/overflow data)
-        //    Negative bloom filter skips most of these.
+        // 3. Inactive segments (bloom-filtered)
         for inactive in &mut state.inactive {
-            if inactive.definitely_not_here(key) {
-                continue;
-            }
+            if inactive.definitely_not_here(key) { continue; }
             if let Some(value) = inactive_get(inactive, key)? {
                 return Ok(Some(value));
             }
@@ -200,25 +206,18 @@ impl DB {
         Ok(None)
     }
 
-    /// Scan all keys in [start, end). Returns entries in sorted order.
-    /// Primary path: iterate active segment sequentially.
-    /// Gap-fill: consult inactive segments for keys not in active.
-    pub fn scan(
-        &self,
-        start: &[u8],
-        end: &[u8],
-    ) -> Result<Vec<(Bytes, Bytes)>> {
+    pub fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
         let read_seq = self.next_seq.load(Ordering::Relaxed);
-        let mut results: std::collections::BTreeMap<Bytes, Bytes> = std::collections::BTreeMap::new();
+        let mut results: std::collections::BTreeMap<Bytes, Bytes> =
+            std::collections::BTreeMap::new();
 
         let mut state = self.state.write();
 
-        // Collect from inactive (lowest priority — will be overwritten)
+        // 1. Inactive segments (lowest priority)
         for inactive in &mut state.inactive {
-            let iter = inactive.iter()?;
-            for item in iter {
+            for item in inactive.iter()? {
                 let (raw_key, val) = item?;
-                if let Ok(ikey) = heliosdb_types::InternalKey::decode(&raw_key) {
+                if let Ok(ikey) = InternalKey::decode(&raw_key) {
                     if ikey.seq_num > read_seq { continue; }
                     let uk = ikey.user_key.clone();
                     if uk.as_ref() >= start && uk.as_ref() < end {
@@ -230,12 +229,11 @@ impl DB {
             }
         }
 
-        // Collect from active segment (overwrites inactive)
+        // 2. Active segment
         if let Some(ref mut active) = state.active {
-            let iter = active.iter()?;
-            for item in iter {
+            for item in active.iter()? {
                 let (raw_key, val) = item?;
-                if let Ok(ikey) = heliosdb_types::InternalKey::decode(&raw_key) {
+                if let Ok(ikey) = InternalKey::decode(&raw_key) {
                     if ikey.seq_num > read_seq { continue; }
                     let uk = ikey.user_key.clone();
                     if uk.as_ref() >= start && uk.as_ref() < end {
@@ -249,15 +247,18 @@ impl DB {
             }
         }
 
-        // MemTable has highest priority
-        for (ikey, val) in state.memtable.iter().into_iter() {
-            if ikey.seq_num > read_seq { continue; }
-            let uk = ikey.user_key.clone();
-            if uk.as_ref() >= start && uk.as_ref() < end {
-                if ikey.op_type == heliosdb_types::OpType::Put {
-                    results.insert(uk, val);
-                } else {
-                    results.remove(&uk);
+        // 3. MemTableSet sources: oldest immutable → newest → active
+        //    Each overwrites the previous, so active ends up highest priority.
+        for entries in state.memtable_set.iter_all_by_priority() {
+            for (ikey, val) in entries {
+                if ikey.seq_num > read_seq { continue; }
+                let uk = ikey.user_key.clone();
+                if uk.as_ref() >= start && uk.as_ref() < end {
+                    if ikey.op_type == heliosdb_types::OpType::Put {
+                        results.insert(uk, val);
+                    } else {
+                        results.remove(&uk);
+                    }
                 }
             }
         }
@@ -269,121 +270,155 @@ impl DB {
     // Flush
     // -----------------------------------------------------------------------
 
-    /// Flush the MemTable into a new ActiveSegment by merging it with the
-    /// existing active segment (if any).  The old active file is deleted.
-    ///
-    /// **Invariant maintained**: the new active segment always contains the
-    /// latest version of every live key — MemTable entries win over old active
-    /// entries for the same user_key.
-    fn flush_locked(&self, state: &mut DbState) -> Result<()> {
-        if state.memtable.is_empty() {
-            return Ok(());
-        }
-
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros();
-        let new_active_path = self.dir.join(format!("active_{ts}.sst"));
-
-        // --- collect old active entries (lower priority) ---
-        let old_active_path: Option<PathBuf>;
-        let active_entries: Vec<(InternalKey, Bytes)> = if let Some(mut old) = state.active.take() {
-            old_active_path = Some(old.path().to_path_buf());
-            old.iter()?
-                .filter_map(|r| r.ok())
-                .filter_map(|(raw_key, val)| {
-                    InternalKey::decode(&raw_key).ok().map(|ik| (ik, val))
-                })
-                .collect()
-        } else {
-            old_active_path = None;
-            Vec::new()
+    /// Flush one immutable memtable into the active SST.
+    /// Does NOT rotate the WAL — the WAL still covers the remaining
+    /// immutables and the current active memtable.
+    fn flush_oldest_immutable_locked(&self, state: &mut DbState<M>) -> Result<()> {
+        let oldest = match state.memtable_set.pop_oldest_immutable() {
+            Some(m) => m,
+            None    => return Ok(()),
         };
 
-        // --- merge: MemTable (priority 0) beats old active (priority 1) ---
+        let new_active_path = self.new_active_path();
+
+        // Collect old active SST entries (lower priority than the immutable).
+        let (old_active_path, active_entries) = self.drain_active_sst(state)?;
+
+        // Merge: immutable (priority 0) beats old active SST (priority 1).
         let mem_iter: Box<dyn Iterator<Item = (InternalKey, Bytes)> + Send> =
-            Box::new(state.memtable.iter().into_iter());
-        let active_iter: Box<dyn Iterator<Item = (InternalKey, Bytes)> + Send> =
+            Box::new(oldest.iter().into_iter());
+        let sst_iter: Box<dyn Iterator<Item = (InternalKey, Bytes)> + Send> =
             Box::new(active_entries.into_iter());
-        let merged = MergeIterator::new(vec![mem_iter, active_iter]);
+        let merged = MergeIterator::new(vec![mem_iter, sst_iter]);
 
-        // --- write merged output to new active SST ---
-        let mut buf: Vec<u8> = Vec::new();
-        let expected = (state.memtable.size_bytes() / 64).max(64);
-        let mut builder = SstBuilder::new(Cursor::new(&mut buf), expected, self.opts.compression);
-        for (ikey, value) in merged {
-            builder.add(&ikey.encode(), &value)?;
-        }
-        builder.finish()?;
-        std::fs::write(&new_active_path, &buf)?;
+        let expected = (oldest.size_bytes() / 64).max(64);
+        self.write_sst(&new_active_path, merged, expected)?;
 
-        // --- atomically swap: delete old active, promote new active ---
-        if let Some(ref old_path) = old_active_path {
-            let _ = std::fs::remove_file(old_path);
-        }
-
-        let new_active = ActiveSegment::open(&new_active_path)?;
-        state.active = Some(new_active);
-
-        // --- update manifest ---
-        state.manifest.append(&Edit::SetActive { path: new_active_path.clone() })?;
-        state.manifest.append(&Edit::SetNextSeq {
-            seq: self.next_seq.load(Ordering::Relaxed),
-        })?;
-        state.version.set_active(new_active_path);
-
-        // --- reset MemTable and rotate WAL ---
-        state.memtable = MemTable::new();
-        state.wal = Wal::create(&self.dir.join("WAL"))?;
+        if let Some(ref p) = old_active_path { let _ = std::fs::remove_file(p); }
+        self.promote_active(state, new_active_path)?;
 
         Ok(())
     }
 
-    /// Force a flush even if the MemTable hasn't hit the size limit.
+    /// Full flush: seal the active memtable, drain the entire immutable queue,
+    /// then rotate the WAL (now safe — all data is persisted in SST).
+    fn flush_locked(&self, state: &mut DbState<M>) -> Result<()> {
+        // Seal the active memtable if it has data.
+        if !state.memtable_set.active_is_empty() {
+            if state.memtable_set.is_at_capacity() {
+                self.flush_oldest_immutable_locked(state)?;
+            }
+            state.memtable_set.rotate();
+        }
+
+        // Flush every immutable in order (oldest first).
+        while state.memtable_set.immutable_count() > 0 {
+            self.flush_oldest_immutable_locked(state)?;
+        }
+
+        // All data is now in SST — safe to truncate the WAL.
+        state.wal = Wal::create(&self.dir.join("WAL"))?;
+        Ok(())
+    }
+
+    /// Force a full flush even if the memtable hasn't hit the size limit.
     pub fn flush(&self) -> Result<()> {
         let mut state = self.state.write();
         self.flush_locked(&mut state)
     }
+
+    // -----------------------------------------------------------------------
+    // Flush helpers
+    // -----------------------------------------------------------------------
+
+    fn new_active_path(&self) -> PathBuf {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        self.dir.join(format!("active_{ts}.sst"))
+    }
+
+    /// Take the current active SST out of state, returning its path and entries.
+    fn drain_active_sst(
+        &self,
+        state: &mut DbState<M>,
+    ) -> Result<(Option<PathBuf>, Vec<(InternalKey, Bytes)>)> {
+        if let Some(mut old) = state.active.take() {
+            let path = Some(old.path().to_path_buf());
+            let entries = old.iter()?
+                .filter_map(|r| r.ok())
+                .filter_map(|(raw, val)| InternalKey::decode(&raw).ok().map(|ik| (ik, val)))
+                .collect();
+            Ok((path, entries))
+        } else {
+            Ok((None, Vec::new()))
+        }
+    }
+
+    fn write_sst(
+        &self,
+        path: &Path,
+        merged: impl Iterator<Item = (InternalKey, Bytes)>,
+        expected_keys: usize,
+    ) -> Result<()> {
+        let mut buf = Vec::new();
+        let mut builder = SstBuilder::new(
+            Cursor::new(&mut buf),
+            expected_keys,
+            self.opts.compression,
+        );
+        for (ikey, value) in merged {
+            builder.add(&ikey.encode(), &value)?;
+        }
+        builder.finish()?;
+        std::fs::write(path, &buf)?;
+        Ok(())
+    }
+
+    fn promote_active(&self, state: &mut DbState<M>, path: PathBuf) -> Result<()> {
+        let new_active = ActiveSegment::open(&path)?;
+        state.active = Some(new_active);
+        state.manifest.append(&Edit::SetActive { path: path.clone() })?;
+        state.manifest.append(&Edit::SetNextSeq {
+            seq: self.next_seq.load(Ordering::Relaxed),
+        })?;
+        state.version.set_active(path);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: look up a user_key in segment files (which store encoded InternalKeys)
+// Helpers: point-lookup inside segment files
 // ---------------------------------------------------------------------------
 
 fn active_get(active: &mut ActiveSegment, user_key: &[u8]) -> Result<Option<Bytes>> {
-    let iter = active.iter()?;
-    for item in iter {
+    for item in active.iter()? {
         let (raw_key, val) = item?;
-        if let Ok(ikey) = heliosdb_types::InternalKey::decode(&raw_key) {
+        if let Ok(ikey) = InternalKey::decode(&raw_key) {
             if ikey.user_key.as_ref() == user_key {
                 return match ikey.op_type {
                     heliosdb_types::OpType::Put    => Ok(Some(val)),
                     heliosdb_types::OpType::Delete => Ok(None),
                 };
             }
-            if ikey.user_key.as_ref() > user_key {
-                break; // sorted order — key not present
-            }
+            if ikey.user_key.as_ref() > user_key { break; }
         }
     }
     Ok(None)
 }
 
 fn inactive_get(inactive: &mut InactiveSegment, user_key: &[u8]) -> Result<Option<Bytes>> {
-    let iter = inactive.iter()?;
-    for item in iter {
+    for item in inactive.iter()? {
         let (raw_key, val) = item?;
-        if let Ok(ikey) = heliosdb_types::InternalKey::decode(&raw_key) {
+        if let Ok(ikey) = InternalKey::decode(&raw_key) {
             if ikey.user_key.as_ref() == user_key {
                 return match ikey.op_type {
                     heliosdb_types::OpType::Put    => Ok(Some(val)),
                     heliosdb_types::OpType::Delete => Ok(None),
                 };
             }
-            if ikey.user_key.as_ref() > user_key {
-                break;
-            }
+            if ikey.user_key.as_ref() > user_key { break; }
         }
     }
     Ok(None)

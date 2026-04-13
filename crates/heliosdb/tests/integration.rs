@@ -1,11 +1,13 @@
 use bytes::Bytes;
-use heliosdb::{Options, DB};
+use heliosdb::{Options, SkipListMemTable, DB};
 use std::collections::HashMap;
 use tempfile::tempdir;
 
+type TestDB = DB<SkipListMemTable>;
+
 fn small_opts() -> Options {
     Options {
-        memtable_size_limit: 4 * 1024, // 4 KiB — triggers flush quickly
+        write_buffer_size: 4 * 1024, // 4 KiB — triggers flush quickly
         ..Options::default()
     }
 }
@@ -17,7 +19,7 @@ fn small_opts() -> Options {
 #[test]
 fn put_get_roundtrip() {
     let dir = tempdir().unwrap();
-    let db = DB::open(dir.path(), Options::default()).unwrap();
+    let db = TestDB::open(dir.path(), Options::default()).unwrap();
     db.put(b"hello", b"world").unwrap();
     assert_eq!(db.get(b"hello").unwrap().as_deref(), Some(b"world".as_ref()));
 }
@@ -25,14 +27,14 @@ fn put_get_roundtrip() {
 #[test]
 fn get_missing_returns_none() {
     let dir = tempdir().unwrap();
-    let db = DB::open(dir.path(), Options::default()).unwrap();
+    let db = TestDB::open(dir.path(), Options::default()).unwrap();
     assert!(db.get(b"ghost").unwrap().is_none());
 }
 
 #[test]
 fn delete_removes_key() {
     let dir = tempdir().unwrap();
-    let db = DB::open(dir.path(), Options::default()).unwrap();
+    let db = TestDB::open(dir.path(), Options::default()).unwrap();
     db.put(b"k", b"v").unwrap();
     db.delete(b"k").unwrap();
     assert!(db.get(b"k").unwrap().is_none());
@@ -41,7 +43,7 @@ fn delete_removes_key() {
 #[test]
 fn overwrite_returns_latest_value() {
     let dir = tempdir().unwrap();
-    let db = DB::open(dir.path(), Options::default()).unwrap();
+    let db = TestDB::open(dir.path(), Options::default()).unwrap();
     db.put(b"k", b"v1").unwrap();
     db.put(b"k", b"v2").unwrap();
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"v2".as_ref()));
@@ -54,7 +56,7 @@ fn overwrite_returns_latest_value() {
 #[test]
 fn read_after_explicit_flush() {
     let dir = tempdir().unwrap();
-    let db = DB::open(dir.path(), Options::default()).unwrap();
+    let db = TestDB::open(dir.path(), Options::default()).unwrap();
     db.put(b"persisted", b"yes").unwrap();
     db.flush().unwrap();
     assert_eq!(db.get(b"persisted").unwrap().as_deref(), Some(b"yes".as_ref()));
@@ -63,7 +65,7 @@ fn read_after_explicit_flush() {
 #[test]
 fn flush_triggered_by_memtable_size() {
     let dir = tempdir().unwrap();
-    let db = DB::open(dir.path(), small_opts()).unwrap();
+    let db = TestDB::open(dir.path(), small_opts()).unwrap();
     // Write enough to trigger at least one automatic flush
     for i in 0u32..200 {
         db.put(
@@ -93,12 +95,12 @@ fn flush_triggered_by_memtable_size() {
 fn wal_recovery_after_reopen() {
     let dir = tempdir().unwrap();
     {
-        let db = DB::open(dir.path(), Options::default()).unwrap();
+        let db = TestDB::open(dir.path(), Options::default()).unwrap();
         db.put(b"durable", b"yes").unwrap();
         // No explicit flush — data is only in WAL + MemTable
     }
     // Reopen: WAL should be replayed
-    let db2 = DB::open(dir.path(), Options::default()).unwrap();
+    let db2 = TestDB::open(dir.path(), Options::default()).unwrap();
     assert_eq!(db2.get(b"durable").unwrap().as_deref(), Some(b"yes".as_ref()));
 }
 
@@ -109,7 +111,7 @@ fn wal_recovery_after_reopen() {
 #[test]
 fn active_segment_holds_latest_after_flush() {
     let dir = tempdir().unwrap();
-    let db = DB::open(dir.path(), Options::default()).unwrap();
+    let db = TestDB::open(dir.path(), Options::default()).unwrap();
 
     db.put(b"fruit", b"apple").unwrap();
     db.flush().unwrap();
@@ -128,7 +130,7 @@ fn active_segment_holds_latest_after_flush() {
 #[test]
 fn scan_matches_hashmap_oracle() {
     let dir = tempdir().unwrap();
-    let db = DB::open(dir.path(), small_opts()).unwrap();
+    let db = TestDB::open(dir.path(), small_opts()).unwrap();
 
     let mut oracle: HashMap<String, String> = HashMap::new();
 
@@ -166,7 +168,7 @@ fn scan_matches_hashmap_oracle() {
 #[test]
 fn tombstone_visible_after_flush() {
     let dir = tempdir().unwrap();
-    let db = DB::open(dir.path(), Options::default()).unwrap();
+    let db = TestDB::open(dir.path(), Options::default()).unwrap();
     db.put(b"dead", b"value").unwrap();
     db.flush().unwrap();
     db.delete(b"dead").unwrap();
