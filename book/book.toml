@@ -1,0 +1,10 @@
+[book]
+title       = "heliosDB"
+description = "A Ressi-inspired embedded key-value storage engine in Rust"
+authors     = ["heliosDB contributors"]
+language    = "en"
+src         = "src"
+
+[output.html]
+git-repository-url = "https://github.com/your-org/heliosdb"
+edit-url-template  = "https://github.com/your-org/heliosdb/edit/main/book/src/{path}"
